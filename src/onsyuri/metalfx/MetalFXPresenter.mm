@@ -48,8 +48,10 @@ struct Impl {
     id<MTLTexture> inputTexture;
     id<MTLTexture> outputTexture;
     id<MTLTexture> maskTexture;
+    id<MTLTexture> aaTexture;
     id<MTLRenderPipelineState> pipeline;
     id<MTLRenderPipelineState> maskedPipeline;
+    id<MTLRenderPipelineState> aaPipeline;
     id<MTLSamplerState> sampler;
     MTLTextureUsage colorUsage;
     MTLTextureUsage outputUsage;
@@ -58,6 +60,8 @@ struct Impl {
     SDL_Surface *textLayer = nullptr;
     bool maskEnabled = true;
     bool testMask = false;
+    bool aaEnabled = false;
+    bool aaDisabledLogged = false;
     char *maskDumpPath = nullptr;
     bool maskDumped = false;
 
@@ -76,6 +80,9 @@ struct Impl {
 
 bool rebuildForOutputSize(Impl &p);
 bool ensurePipeline(Impl &p);
+bool encodeAAPass(id<MTLCommandBuffer> cb, Impl &p, id<MTLTexture> src, id<MTLTexture> dst,
+                  id<MTLTexture> mask, id<MTLRenderPipelineState> pipeline,
+                  float texelX, float texelY);
 
 Presenter::Presenter(SDL_Window *window, void *metal_view, int game_width, int game_height)
     : impl_(new Impl) {
@@ -94,6 +101,11 @@ Presenter::Presenter(SDL_Window *window, void *metal_view, int game_width, int g
     const char *test_env = getenv("YOGHOURT_ONS_METALFX_TESTMASK");
     if (test_env && strcmp(test_env, "1") == 0) {
         impl_->testMask = true;
+    }
+    // Selective AA: masked FXAA at game resolution before MetalFX.
+    const char *aa_env = getenv("YOGHOURT_ONS_METALFX_AA");
+    if (aa_env && strcmp(aa_env, "1") == 0) {
+        impl_->aaEnabled = true;
     }
 
     if (!metal_view) {
@@ -253,6 +265,21 @@ bool rebuildForOutputSize(Impl &p) {
         }
     }
 
+    if (p.aaEnabled && !p.aaTexture) {
+        MTLTextureDescriptor *aaDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:kFramePixelFormat
+                                                                                          width:(NSUInteger)p.gameW
+                                                                                         height:(NSUInteger)p.gameH
+                                                                                      mipmapped:NO];
+        aaDesc.storageMode = MTLStorageModePrivate;
+        aaDesc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+        p.aaTexture = [p.device newTextureWithDescriptor:aaDesc];
+        if (!p.aaTexture) {
+            logLine("[MetalFX] disabled: aa texture creation failed");
+            p.active = false;
+            return false;
+        }
+    }
+
     return true;
 }
 
@@ -287,6 +314,46 @@ bool ensurePipeline(Impl &p) {
         "  float4 m = mask.sample(smp, in.uv);\n"
         "  if (m.a <= 0.0) return tex.sample(smp, in.uv);\n"
         "  return mix(tex.sample(smp, in.uv), plain.sample(smp, in.uv), m.a);\n"
+        "}\n"
+        // Selective AA pass (FXAA 3.11 console-style, masked): pixels inside
+        // or adjacent to the exclusion mask (glyph/UI protection, ~1px
+        // dilation) pass through untouched; everything else gets FXAA.
+        "fragment float4 fsFxaaMasked(VOut in [[stage_in]],\n"
+        "                             texture2d<float> tex [[texture(0)]],\n"
+        "                             texture2d<float> maskTex [[texture(1)]],\n"
+        "                             sampler smp [[sampler(0)]],\n"
+        "                             constant float2 &texel [[buffer(2)]]) {\n"
+        "  float2 uv = in.uv;\n"
+        "  float mSelf = maskTex.sample(smp, uv).a;\n"
+        "  float mR = maskTex.sample(smp, uv + float2( texel.x, 0.0)).a;\n"
+        "  float mL = maskTex.sample(smp, uv + float2(-texel.x, 0.0)).a;\n"
+        "  float mU = maskTex.sample(smp, uv + float2(0.0,  texel.y)).a;\n"
+        "  float mD = maskTex.sample(smp, uv + float2(0.0, -texel.y)).a;\n"
+        "  float mMax = max(max(mSelf, mR), max(mL, max(mU, mD)));\n"
+        "  if (mMax > 0.05) return tex.sample(smp, uv);\n"
+        "  float3 rgbNW = tex.sample(smp, uv + float2(-texel.x, -texel.y)).rgb;\n"
+        "  float3 rgbNE = tex.sample(smp, uv + float2( texel.x, -texel.y)).rgb;\n"
+        "  float3 rgbSW = tex.sample(smp, uv + float2(-texel.x,  texel.y)).rgb;\n"
+        "  float3 rgbSE = tex.sample(smp, uv + float2( texel.x,  texel.y)).rgb;\n"
+        "  float3 rgbM  = tex.sample(smp, uv).rgb;\n"
+        "  float3 luma = float3(0.299, 0.587, 0.114);\n"
+        "  float lumaNW = dot(rgbNW, luma), lumaNE = dot(rgbNE, luma);\n"
+        "  float lumaSW = dot(rgbSW, luma), lumaSE = dot(rgbSE, luma);\n"
+        "  float lumaM  = dot(rgbM, luma);\n"
+        "  float lumaMin = min(lumaM, min(min(lumaNW, lumaNE), min(lumaSW, lumaSE)));\n"
+        "  float lumaMax = max(lumaM, max(max(lumaNW, lumaNE), max(lumaSW, lumaSE)));\n"
+        "  float2 dir = float2(-((lumaNW + lumaNE) - (lumaSW + lumaSE)),\n"
+        "                       ((lumaNW + lumaSW) - (lumaNE + lumaSE)));\n"
+        "  float dirReduce = max((lumaNW + lumaNE + lumaSW + lumaSE) * 0.25 * (1.0 / 12.0), 1.0 / 128.0);\n"
+        "  float rcpDirMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + dirReduce);\n"
+        "  dir = clamp(dir * rcpDirMin, float2(-8.0, -8.0), float2(8.0, 8.0)) * texel;\n"
+        "  float3 rgbA = 0.5 * (tex.sample(smp, uv + dir * (1.0/3.0 - 0.5)).rgb +\n"
+        "                        tex.sample(smp, uv + dir * (1.0/3.0 + 0.5)).rgb);\n"
+        "  float3 rgbB = rgbA * 0.5 + 0.25 * (tex.sample(smp, uv + dir * -0.5).rgb +\n"
+        "                                      tex.sample(smp, uv + dir *  0.5).rgb);\n"
+        "  float lumaB = dot(rgbB, luma);\n"
+        "  if ((lumaB < lumaMin) || (lumaB > lumaMax)) return float4(rgbA, 1.0);\n"
+        "  return float4(rgbB, 1.0);\n"
         "}\n";
 
     NSError *err = nil;
@@ -325,6 +392,20 @@ bool ensurePipeline(Impl &p) {
         }
     }
 
+    if (p.aaEnabled) {
+        MTLRenderPipelineDescriptor *apd = [[MTLRenderPipelineDescriptor alloc] init];
+        apd.vertexFunction = [lib newFunctionWithName:@"vs"];
+        apd.fragmentFunction = [lib newFunctionWithName:@"fsFxaaMasked"];
+        apd.colorAttachments[0].pixelFormat = kFramePixelFormat;
+        err = nil;
+        p.aaPipeline = [p.device newRenderPipelineStateWithDescriptor:apd error:&err];
+        if (!p.aaPipeline) {
+            logLine("[MetalFX] disabled: aa pipeline creation failed: %s",
+                    err ? [[err localizedDescription] UTF8String] : "unknown");
+            return false;
+        }
+    }
+
     MTLSamplerDescriptor *sd = [[MTLSamplerDescriptor alloc] init];
     sd.minFilter = MTLSamplerMinMagFilterLinear;
     sd.magFilter = MTLSamplerMinMagFilterLinear;
@@ -340,6 +421,31 @@ bool ensurePipeline(Impl &p) {
 
 // Writes the alpha channel of a shared staging texture as an 8-bit BMP.
 // Debug helper for verifying which pixels the text mask covers.
+// Renders `src` through the masked selective-AA pipeline into `dst` at full
+// texture size; `mask` gates which pixels may be processed.
+bool encodeAAPass(id<MTLCommandBuffer> cb, Impl &p, id<MTLTexture> src, id<MTLTexture> dst,
+                  id<MTLTexture> mask, id<MTLRenderPipelineState> pipeline,
+                  float texelX, float texelY) {
+    MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+    rpd.colorAttachments[0].texture = dst;
+    rpd.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rpd];
+    [re setRenderPipelineState:pipeline];
+    [re setFragmentTexture:src atIndex:0];
+    [re setFragmentTexture:mask atIndex:1];
+    [re setFragmentSamplerState:p.sampler atIndex:0];
+    const float texel[2] = {texelX, texelY};
+    [re setFragmentBytes:texel length:sizeof(texel) atIndex:2];
+    const float pos[8] = {-1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f};
+    const float uvs[8] = {0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f};
+    [re setVertexBytes:pos length:sizeof(pos) atIndex:0];
+    [re setVertexBytes:uvs length:sizeof(uvs) atIndex:1];
+    [re drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+    [re endEncoding];
+    return true;
+}
+
 bool dumpMaskToBMP(id<MTLTexture> staging, Impl &p) {
     if (staging.storageMode != MTLStorageModeShared) {
         return false;
@@ -434,10 +540,11 @@ bool Presenter::present(SDL_Surface *frame) {
 
     if (!p.diagnosticsLogged) {
         const char *deviceName = p.device.name ? [p.device.name UTF8String] : "unknown";
-        logLine("[MetalFX] init: device=%s game=%dx%d drawable=%dx%d out=%dx%d color=%s mode=%s scaler=%s textmask=%s",
+        logLine("[MetalFX] init: device=%s game=%dx%d drawable=%dx%d out=%dx%d color=%s mode=%s scaler=%s textmask=%s aa=%s",
                 deviceName, p.gameW, p.gameH, p.drawW, p.drawH, p.outW, p.outH,
                 kPixelFormatBGRA8, p.colorMode == MTLFXSpatialScalerColorProcessingModePerceptual ? "perceptual" : "other",
-                p.useScaler ? "yes" : "no", p.maskEnabled ? "on" : "off");
+                p.useScaler ? "yes" : "no", p.maskEnabled ? "on" : "off",
+                p.aaEnabled ? "masked-fxaa" : "off");
         p.diagnosticsLogged = true;
     }
 
@@ -489,6 +596,7 @@ bool Presenter::present(SDL_Surface *frame) {
     // Upload the text layer alpha mask (full-screen, same layout as the
     // frame) so the final pass can keep post-processing off glyph shapes.
     bool maskReady = false;
+    bool maskHasContent = false;
     if (p.maskEnabled && p.maskTexture) {
         MTLTextureDescriptor *maskStDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:kFramePixelFormat
                                                                                              width:(NSUInteger)p.gameW
@@ -517,10 +625,21 @@ bool Presenter::present(SDL_Surface *frame) {
                                  withBytes:pattern.data()
                                bytesPerRow:rowBytes];
                 maskReady = true;
+                maskHasContent = true;
             } else if (p.textLayer) {
                 SDL_Surface *tl = p.textLayer;
                 if (tl->w == p.gameW && tl->h == p.gameH &&
                     tl->format->format == SDL_PIXELFORMAT_ARGB8888) {
+                    // Quick CPU scan for glyph pixels; an empty text layer
+                    // means no dynamic text this frame, so selective AA must
+                    // stay off rather than degrade into full-frame FXAA.
+                    const unsigned char *px = (const unsigned char *)tl->pixels;
+                    for (int y = 0; y < p.gameH && !maskHasContent; ++y) {
+                        const unsigned char *row = px + (size_t)y * tl->pitch;
+                        for (int x = 0; x < p.gameW; ++x) {
+                            if (row[x * 4 + 3] != 0) { maskHasContent = true; break; }
+                        }
+                    }
                     [maskStaging replaceRegion:MTLRegionMake2D(0, 0, p.gameW, p.gameH)
                                    mipmapLevel:0
                                      withBytes:tl->pixels
@@ -549,9 +668,25 @@ bool Presenter::present(SDL_Surface *frame) {
     }
     [blit endEncoding];
 
+    // Selective AA runs at game resolution on the unmasked pixels only; the
+    // masked (protected) pixels pass through untouched. The result feeds
+    // MetalFX, which still processes the whole frame including text.
     id<MTLTexture> srcTexture = p.inputTexture;
+    bool aaActive = p.aaEnabled && maskHasContent && p.useScaler;
+    if (aaActive) {
+        if (!encodeAAPass(cb, p, p.inputTexture, p.aaTexture, p.maskTexture, p.aaPipeline,
+                          1.0f / (float)p.gameW, 1.0f / (float)p.gameH)) {
+            p.active = false;
+            return false;
+        }
+        srcTexture = p.aaTexture;
+    } else if (p.aaEnabled && !p.aaDisabledLogged && !maskHasContent) {
+        logLine("[MetalFX] selective AA off: empty exclusion mask (no text layer this frame)");
+        p.aaDisabledLogged = true;
+    }
+
     if (p.useScaler) {
-        p.scaler.colorTexture = p.inputTexture;
+        p.scaler.colorTexture = srcTexture;
         p.scaler.inputContentWidth = (NSUInteger)p.gameW;
         p.scaler.inputContentHeight = (NSUInteger)p.gameH;
         p.scaler.outputTexture = p.outputTexture;
@@ -565,9 +700,9 @@ bool Presenter::present(SDL_Surface *frame) {
     rpd.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
     rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
     id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rpd];
-    if (maskReady && p.useScaler) {
-        // Text-protected composite: MetalFX everywhere except glyph areas,
-        // which sample the plain input (linear upscale).
+    if (!aaActive && maskReady && p.useScaler) {
+        // Legacy text-protected composite: MetalFX everywhere except glyph
+        // areas, which sample the plain input (linear upscale).
         [re setRenderPipelineState:p.maskedPipeline];
         [re setFragmentTexture:srcTexture atIndex:0];
         [re setFragmentTexture:p.inputTexture atIndex:1];
@@ -576,7 +711,6 @@ bool Presenter::present(SDL_Surface *frame) {
         [re setRenderPipelineState:p.pipeline];
         [re setFragmentTexture:srcTexture atIndex:0];
     }
-    [re setFragmentSamplerState:p.sampler atIndex:0];
     [re setFragmentSamplerState:p.sampler atIndex:0];
 
     // Letterboxed quad in NDC (Metal: y up, origin top-left in pixel space).
