@@ -81,9 +81,18 @@ function(config_linux TARGET_NAME)
 endfunction()
 
 function(config_darwin TARGET_NAME)
+    set(YOGHOURT_SPATIAL_PRESENTER_DIR "" CACHE PATH
+        "Path to Yoghourt's shared SpatialPresenter sources")
+    if(NOT YOGHOURT_SPATIAL_PRESENTER_DIR OR
+       NOT EXISTS "${YOGHOURT_SPATIAL_PRESENTER_DIR}/YoghourtSpatialPresenter.mm")
+        message(FATAL_ERROR
+            "Set YOGHOURT_SPATIAL_PRESENTER_DIR to RuntimeSupport/SpatialPresenter")
+    endif()
     add_executable(${TARGET_NAME} ${ONSYURI_CODE})
     target_sources(${TARGET_NAME} PRIVATE src/onsyuri/YoghourtPresentation.mm)
     target_sources(${TARGET_NAME} PRIVATE src/onsyuri/metalfx/MetalFXPresenter.mm)
+    target_sources(${TARGET_NAME} PRIVATE
+        "${YOGHOURT_SPATIAL_PRESENTER_DIR}/YoghourtSpatialPresenter.mm")
     message("Darwin enviroment for ${TARGET_NAME}, type ${CMAKE_BUILD_TYPE}, compiler ${CMAKE_C_COMPILER}")
     target_compile_definitions(${TARGET_NAME} PRIVATE
             ${ONSYURI_DEFINES}
@@ -111,6 +120,7 @@ function(config_darwin TARGET_NAME)
 
     target_include_directories(${TARGET_NAME} PRIVATE
             ${LUA_INCLUDE_DIR}
+            "${YOGHOURT_SPATIAL_PRESENTER_DIR}"
     )
     target_link_libraries(${TARGET_NAME} PRIVATE
             BZip2::BZip2
