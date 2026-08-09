@@ -687,7 +687,7 @@ void dumpCunnyOutput(Impl &p, SDL_Surface *frame, id<MTLCommandBuffer> cb) {
         if (fo) {
             fwrite(buf.contents, 1, bytes, fo);
             fclose(fo);
-            logLine("[MetalFX] cunny dumped: %s and %s", inPath, outPath);
+            logLine("[MetalFX] cunny dumped: %s/input.bgra and %s", p.cunnyDumpDir, outPath);
         }
     }];
     p.cunnyDumped = true;
