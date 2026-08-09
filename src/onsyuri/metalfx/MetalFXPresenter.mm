@@ -20,7 +20,10 @@ struct Impl {
 namespace {
 
 yoghourt_spatial::ScalerMode scalerModeFromEnvironment() {
-    const char *value = getenv("YOGHOURT_ONS_METALFX_SCALER");
+    const char *value = getenv("YOGHOURT_SPATIAL_SCALER");
+    if (!value || !value[0]) {
+        value = getenv("YOGHOURT_ONS_METALFX_SCALER");
+    }
     if (value && strcmp(value, "cunny") == 0) {
         return yoghourt_spatial::ScalerMode::cuNNy;
     }

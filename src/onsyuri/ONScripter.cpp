@@ -299,8 +299,10 @@ void ONScripter::initSDL()
     // Create the Metal view before SDL_CreateRenderer so an existing Metal
     // renderer reuses it instead of creating a second presentation view.
     SDL_MetalView metal_view = NULL;
-    const char *metalfx_env = getenv("YOGHOURT_ONS_METALFX");
-    bool metalfx_requested = metalfx_env && strcmp(metalfx_env, "0") != 0;
+    const char *spatial_env = getenv("YOGHOURT_SPATIAL_SCALER");
+    const char *legacy_metalfx_env = getenv("YOGHOURT_ONS_METALFX");
+    bool metalfx_requested = (spatial_env && spatial_env[0]) ||
+        (legacy_metalfx_env && strcmp(legacy_metalfx_env, "0") != 0);
     if (metalfx_requested) {
         metal_view = SDL_Metal_CreateView(window);
         if (!metal_view) {
