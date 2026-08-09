@@ -76,6 +76,9 @@ struct Impl {
     bool useScaler = false;
     bool active = false;
     bool diagnosticsLogged = false;
+    int frameCount = 0;
+    CFAbsoluteTime lastFreqLog = 0;
+    int freqFrames = 0;
 };
 
 bool rebuildForOutputSize(Impl &p);
@@ -510,6 +513,13 @@ bool Presenter::present(SDL_Surface *frame) {
         return false;
     }
 
+    p.frameCount++;
+    CFAbsoluteTime now0 = CFAbsoluteTimeGetCurrent();
+    if (now0 - p.lastFreqLog > 1.0) {
+        logLine("[MetalFX] present fps: %.1f", (double)(p.frameCount - p.freqFrames) / (now0 - p.lastFreqLog));
+        p.lastFreqLog = now0;
+        p.freqFrames = p.frameCount;
+    }
     int dw = 0, dh = 0;
     SDL_Metal_GetDrawableSize(p.window, &dw, &dh);
     if (dw <= 0 || dh <= 0) {
@@ -548,7 +558,12 @@ bool Presenter::present(SDL_Surface *frame) {
         p.diagnosticsLogged = true;
     }
 
+    CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
     id<CAMetalDrawable> drawable = [p.layer nextDrawable];
+    CFAbsoluteTime t1 = CFAbsoluteTimeGetCurrent();
+    if (t1 - t0 > 0.02) {
+        logLine("[MetalFX] nextDrawable slow: %.3fs (frame %d)", t1 - t0, p.frameCount);
+    }
     if (!drawable) {
         logLine("[MetalFX] disabled: drawable acquisition failed");
         p.active = false;
@@ -728,6 +743,10 @@ bool Presenter::present(SDL_Surface *frame) {
     p.layer.displaySyncEnabled = YES;
     [cb presentDrawable:drawable];
     [cb commit];
+    CFAbsoluteTime now1 = CFAbsoluteTimeGetCurrent();
+    if (now1 - now0 > 0.02) {
+        logLine("[MetalFX] present frame slow: %.3fs (drawable %.3fs)", now1 - now0, t1 - t0);
+    }
     return true;
 }
 
