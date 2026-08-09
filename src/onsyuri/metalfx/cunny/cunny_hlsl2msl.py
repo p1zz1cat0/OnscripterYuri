@@ -13,7 +13,8 @@ Generated MSL semantics:
   - intermediate passes quantize through R8G8B8A8_UNORM writes like the
     HLSL textures
   - PASS 4 reproduces the YUV luma-correction out-shuffle (RY/YR matrices
-    expanded row-wise)
+    expanded row-wise), including HLSL normalized linear-sampler texel-center
+    coordinates
 
 Usage:
   cunny-hlsl2msl.py CuNNy-veryfast-NVL.hlsl > cunny.metal
@@ -98,10 +99,13 @@ def emit_sampler_helpers() -> str:
     static inline float4 cunny_sample_linear(texture2d<float, access::read> tex,
                                              float2 uv, int2 size) {
         float2 c = cunny_clamp(uv, float2(0.0, 0.0), float2(1.0, 1.0));
-        float2 f = c * float2(size);
-        int2 p0 = int2(metal::floor(f));
-        int2 p1 = cunny_clamp(p0 + int2(1, 1), int2(0, 0), size - int2(1, 1));
-        p0 = cunny_clamp(p0, int2(0, 0), size - int2(1, 1));
+        // HLSL SampleLevel with a normalized linear sampler maps texel center
+        // i to (i + 0.5) / size. Preserve that half-texel convention rather
+        // than shifting the base color 0.5 input pixels down and right.
+        float2 f = c * float2(size) - 0.5;
+        int2 rawP0 = int2(metal::floor(f));
+        int2 p0 = cunny_clamp(rawP0, int2(0, 0), size - int2(1, 1));
+        int2 p1 = cunny_clamp(rawP0 + int2(1, 1), int2(0, 0), size - int2(1, 1));
         float2 t = f - metal::floor(f);
         float4 a = tex.read(uint2(p0));
         float4 b = tex.read(uint2(int2(p1.x, p0.y)));

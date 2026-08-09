@@ -3,12 +3,14 @@
 
 Independently reimplements the forward pass of the upstream HLSL
 (funnyplanter/CuNNy commit 906031b, LGPL-3.0) so the MSL port can be
-validated pixel-by-pixel (golden reference validation).
+validated against a non-uniform golden frame. Small integer differences are
+expected because Metal executes the network with half-precision arithmetic.
 
 Weights are parsed from the same HLSL source as the MSL generator, but the
-computation is a separate implementation (numpy, explicit loops), so an
+computation is a separate implementation (numpy, explicit loops), so a close
 agreement between reference and port validates the weight expansion,
-neighbourhood coordinates, pixel shuffle and thread mapping.
+neighbourhood coordinates, normalized sampling, pixel shuffle and thread
+mapping.
 
 Usage:
   cunny_reference.py <input.bgra> <width> <height> <output.bgra>
@@ -130,18 +132,20 @@ def run_conv(img_a: np.ndarray, img_b: np.ndarray | None, ops: list, out_channel
 
 
 def bilinear(img: np.ndarray, u: float, v: float) -> np.ndarray:
-    """Clamped bilinear sample at normalized (u, v)."""
+    """Simulate HLSL SampleLevel with a clamped normalized linear sampler."""
     h, w, c = img.shape
     u = min(max(u, 0.0), 1.0)
     v = min(max(v, 0.0), 1.0)
-    fx = u * (w - 1)
-    fy = v * (h - 1)
-    x0 = int(np.floor(fx))
-    y0 = int(np.floor(fy))
-    x1 = min(x0 + 1, w - 1)
-    y1 = min(y0 + 1, h - 1)
-    tx = fx - x0
-    ty = fy - y0
+    fx = u * w - 0.5
+    fy = v * h - 0.5
+    raw_x0 = int(np.floor(fx))
+    raw_y0 = int(np.floor(fy))
+    x0 = clamp_idx(raw_x0, w)
+    y0 = clamp_idx(raw_y0, h)
+    x1 = clamp_idx(raw_x0 + 1, w)
+    y1 = clamp_idx(raw_y0 + 1, h)
+    tx = fx - raw_x0
+    ty = fy - raw_y0
     a = img[y0, x0]
     b = img[y0, x1]
     cc = img[y1, x0]

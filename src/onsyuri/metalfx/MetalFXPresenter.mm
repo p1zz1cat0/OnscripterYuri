@@ -645,6 +645,26 @@ bool encodeDownscale(id<MTLCommandBuffer> cb, Impl &p, id<MTLTexture> src, id<MT
 // GPU output (via blit readback) once, so the CPU reference implementation
 // can be compared pixel-by-pixel.
 void dumpCunnyOutput(Impl &p, SDL_Surface *frame, id<MTLCommandBuffer> cb) {
+    // ONS presents a uniform black framebuffer before the script draws its
+    // first scene. Do not let that startup frame become the golden sample:
+    // wait until the framebuffer contains at least two distinct RGB colors.
+    const unsigned char *pixels = static_cast<const unsigned char *>(frame->pixels);
+    const unsigned char firstB = pixels[0], firstG = pixels[1], firstR = pixels[2];
+    bool hasVisualDetail = false;
+    for (int y = 0; y < frame->h && !hasVisualDetail; ++y) {
+        const unsigned char *row = pixels + (size_t)y * frame->pitch;
+        for (int x = 0; x < frame->w; ++x) {
+            const unsigned char *pixel = row + (size_t)x * 4;
+            if (pixel[0] != firstB || pixel[1] != firstG || pixel[2] != firstR) {
+                hasVisualDetail = true;
+                break;
+            }
+        }
+    }
+    if (!hasVisualDetail) {
+        return;
+    }
+
     char inPath[1024];
     snprintf(inPath, sizeof(inPath), "%s/input.bgra", p.cunnyDumpDir);
     FILE *f = fopen(inPath, "wb");
