@@ -12,8 +12,10 @@
 #include <SDL_metal.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
+#include <memory>
 #include <vector>
 
 namespace onsyuri_metalfx {
@@ -47,6 +49,7 @@ struct Impl {
     CAMetalLayer *layer;
     id<MTLCommandQueue> queue;
     id<MTLFXSpatialScaler> scaler;
+    id<MTLFXSpatialScaler> cunnyScaler;
     id<MTLTexture> inputTexture;
     id<MTLTexture> outputTexture;
     id<MTLTexture> maskTexture;
@@ -91,6 +94,10 @@ struct Impl {
     int outY = 0;
     bool useScaler = false;
     bool active = false;
+    // Completion handlers outlive individual present() calls and may run after
+    // Presenter destruction. Keep only this shared failure signal in them.
+    // 0 = none, 1 = retry without CuNNy, 2 = disable the Metal presenter.
+    std::shared_ptr<std::atomic<int>> asyncFailure = std::make_shared<std::atomic<int>>(0);
     bool diagnosticsLogged = false;
     int frameCount = 0;
     CFAbsoluteTime lastFreqLog = 0;
@@ -103,7 +110,7 @@ bool encodeAAPass(id<MTLCommandBuffer> cb, Impl &p, id<MTLTexture> src, id<MTLTe
                   id<MTLTexture> mask, id<MTLRenderPipelineState> pipeline,
                   float texelX, float texelY);
 bool ensureCunny(Impl &p);
-bool encodeCunny(id<MTLCommandBuffer> cb, Impl &p);
+bool encodeCunny(id<MTLCommandBuffer> cb, Impl &p, id<MTLTexture> input);
 bool encodeDownscale(id<MTLCommandBuffer> cb, Impl &p, id<MTLTexture> src, id<MTLTexture> dst);
 
 Presenter::Presenter(SDL_Window *window, void *metal_view, int game_width, int game_height)
@@ -241,6 +248,7 @@ bool rebuildForOutputSize(Impl &p) {
     p.outY = (p.drawH - outH) / 2;
 
     p.scaler = nil;
+    p.cunnyScaler = nil;
     p.outputTexture = nil;
 
     if (p.useScaler) {
@@ -260,6 +268,48 @@ bool rebuildForOutputSize(Impl &p) {
         }
         p.colorUsage = p.scaler.colorTextureUsage;
         p.outputUsage = p.scaler.outputTextureUsage;
+
+        // The combined path feeds MetalFX with CuNNy's fixed 2x output. MetalFX
+        // requires the color texture dimensions to match the descriptor, so it
+        // needs a separate scaler from the original-resolution fallback path.
+        const int c2w = p.gameW * 2;
+        const int c2h = p.gameH * 2;
+        if (p.scalerMode == 2 && (outW > c2w || outH > c2h)) {
+            MTLFXSpatialScalerDescriptor *cunnyDesc = [[MTLFXSpatialScalerDescriptor alloc] init];
+            cunnyDesc.colorTextureFormat = kFramePixelFormat;
+            cunnyDesc.outputTextureFormat = kFramePixelFormat;
+            cunnyDesc.inputWidth = (NSUInteger)c2w;
+            cunnyDesc.inputHeight = (NSUInteger)c2h;
+            cunnyDesc.outputWidth = (NSUInteger)outW;
+            cunnyDesc.outputHeight = (NSUInteger)outH;
+            cunnyDesc.colorProcessingMode = p.colorMode;
+            p.cunnyScaler = [cunnyDesc newSpatialScalerWithDevice:p.device];
+            if (!p.cunnyScaler) {
+                logLine("[MetalFX] cunny+metalfx unavailable at output %dx%d; using CuNNy only", outW, outH);
+                p.scalerMode = 1;
+            } else {
+                p.outputUsage |= p.cunnyScaler.outputTextureUsage;
+                const MTLTextureUsage requiredCunnyUsage =
+                    MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | p.cunnyScaler.colorTextureUsage;
+                if (p.cunnyOut && (p.cunnyOut.usage & requiredCunnyUsage) != requiredCunnyUsage) {
+                    MTLTextureDescriptor *cunnyOutDesc =
+                        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:kFramePixelFormat
+                                                                          width:(NSUInteger)c2w
+                                                                         height:(NSUInteger)c2h
+                                                                      mipmapped:NO];
+                    cunnyOutDesc.storageMode = MTLStorageModePrivate;
+                    cunnyOutDesc.usage = requiredCunnyUsage;
+                    id<MTLTexture> replacement = [p.device newTextureWithDescriptor:cunnyOutDesc];
+                    if (!replacement) {
+                        logLine("[MetalFX] cunny+metalfx output texture recreation failed; using CuNNy only");
+                        p.cunnyScaler = nil;
+                        p.scalerMode = 1;
+                    } else {
+                        p.cunnyOut = replacement;
+                    }
+                }
+            }
+        }
     } else {
         p.colorUsage = MTLTextureUsageShaderRead;
         p.outputUsage = MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead;
@@ -314,7 +364,7 @@ bool rebuildForOutputSize(Impl &p) {
                                                                                          height:(NSUInteger)p.gameH
                                                                                       mipmapped:NO];
         aaDesc.storageMode = MTLStorageModePrivate;
-        aaDesc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+        aaDesc.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget | p.colorUsage;
         p.aaTexture = [p.device newTextureWithDescriptor:aaDesc];
         if (!p.aaTexture) {
             logLine("[MetalFX] disabled: aa texture creation failed");
@@ -595,6 +645,9 @@ bool ensureCunny(Impl &p) {
                                                                                 mipmapped:NO];
     oDesc.storageMode = MTLStorageModePrivate;
     oDesc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    if (p.cunnyScaler) {
+        oDesc.usage |= p.cunnyScaler.colorTextureUsage;
+    }
     p.cunnyOut = [p.device newTextureWithDescriptor:oDesc];
 
     if (!p.cunnyT0 || !p.cunnyT1 || !p.cunnyT2 || !p.cunnyT3 || !p.cunnyOut) {
@@ -609,13 +662,20 @@ bool ensureCunny(Impl &p) {
 }
 
 // Encodes the four CuNNy compute passes into `cb`.
-bool encodeCunny(id<MTLCommandBuffer> cb, Impl &p) {
+bool encodeCunny(id<MTLCommandBuffer> cb, Impl &p, id<MTLTexture> input) {
+    if (!cb || !input || !p.cunnyP1 || !p.cunnyP2 || !p.cunnyP3 || !p.cunnyP4 ||
+        !p.cunnyT0 || !p.cunnyT1 || !p.cunnyT2 || !p.cunnyT3 || !p.cunnyOut) {
+        return false;
+    }
     id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+    if (!ce) {
+        return false;
+    }
     const MTLSize grid = MTLSizeMake((NSUInteger)p.gameW, (NSUInteger)p.gameH, 1);
     const MTLSize group = MTLSizeMake(8, 8, 1);
 
     [ce setComputePipelineState:p.cunnyP1];
-    [ce setTexture:p.inputTexture atIndex:0];
+    [ce setTexture:input atIndex:0];
     [ce setTexture:p.cunnyT0 atIndex:1];
     [ce setTexture:p.cunnyT1 atIndex:2];
     [ce dispatchThreads:grid threadsPerThreadgroup:group];
@@ -634,7 +694,7 @@ bool encodeCunny(id<MTLCommandBuffer> cb, Impl &p) {
     [ce dispatchThreads:grid threadsPerThreadgroup:group];
 
     [ce setComputePipelineState:p.cunnyP4];
-    [ce setTexture:p.inputTexture atIndex:0];
+    [ce setTexture:input atIndex:0];
     [ce setTexture:p.cunnyT0 atIndex:1];
     [ce setTexture:p.cunnyOut atIndex:2];
     [ce dispatchThreads:grid threadsPerThreadgroup:group];
@@ -645,7 +705,13 @@ bool encodeCunny(id<MTLCommandBuffer> cb, Impl &p) {
 
 // Encodes the lanczos2 downscale of `src` (2x) into `dst` (target size).
 bool encodeDownscale(id<MTLCommandBuffer> cb, Impl &p, id<MTLTexture> src, id<MTLTexture> dst) {
+    if (!cb || !p.downscalePS || !src || !dst) {
+        return false;
+    }
     id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+    if (!ce) {
+        return false;
+    }
     [ce setComputePipelineState:p.downscalePS];
     [ce setTexture:src atIndex:0];
     [ce setTexture:dst atIndex:1];
@@ -669,7 +735,15 @@ void dumpCunnyOutput(Impl &p, SDL_Surface *frame, id<MTLCommandBuffer> cb) {
     }
     const size_t bytes = (size_t)p.gameW * 2 * p.gameH * 2 * 4;
     id<MTLBuffer> buf = [p.device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+    if (!buf) {
+        logLine("[MetalFX] cunny dump failed: readback buffer creation failed");
+        return;
+    }
     id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+    if (!blit) {
+        logLine("[MetalFX] cunny dump failed: blit encoder creation failed");
+        return;
+    }
     [blit copyFromTexture:p.cunnyOut
               sourceSlice:0
               sourceLevel:0
@@ -680,14 +754,19 @@ void dumpCunnyOutput(Impl &p, SDL_Surface *frame, id<MTLCommandBuffer> cb) {
     destinationBytesPerRow:(NSUInteger)p.gameW * 8
       destinationBytesPerImage:bytes];
     [blit endEncoding];
+    NSString *dumpDir = [NSString stringWithUTF8String:p.cunnyDumpDir];
     [cb addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+        if (completed.status != MTLCommandBufferStatusCompleted) {
+            return;
+        }
         char outPath[1024];
-        snprintf(outPath, sizeof(outPath), "%s/output.bgra", p.cunnyDumpDir);
+        const char *dumpDirPath = [dumpDir UTF8String];
+        snprintf(outPath, sizeof(outPath), "%s/output.bgra", dumpDirPath);
         FILE *fo = fopen(outPath, "wb");
         if (fo) {
             fwrite(buf.contents, 1, bytes, fo);
             fclose(fo);
-            logLine("[MetalFX] cunny dumped: %s/input.bgra and %s", p.cunnyDumpDir, outPath);
+            logLine("[MetalFX] cunny dumped: %s/input.bgra and %s", dumpDirPath, outPath);
         }
     }];
     p.cunnyDumped = true;
@@ -700,11 +779,17 @@ void dumpCunnyOutput(Impl &p, SDL_Surface *frame, id<MTLCommandBuffer> cb) {
 bool encodeAAPass(id<MTLCommandBuffer> cb, Impl &p, id<MTLTexture> src, id<MTLTexture> dst,
                   id<MTLTexture> mask, id<MTLRenderPipelineState> pipeline,
                   float texelX, float texelY) {
+    if (!cb || !src || !dst || !mask || !pipeline || !p.sampler) {
+        return false;
+    }
     MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
     rpd.colorAttachments[0].texture = dst;
     rpd.colorAttachments[0].loadAction = MTLLoadActionDontCare;
     rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
     id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rpd];
+    if (!re) {
+        return false;
+    }
     [re setRenderPipelineState:pipeline];
     [re setFragmentTexture:src atIndex:0];
     [re setFragmentTexture:mask atIndex:1];
@@ -781,6 +866,17 @@ bool dumpMaskToBMP(id<MTLTexture> staging, Impl &p) {
 bool Presenter::present(SDL_Surface *frame) {
     Impl &p = *impl_;
     if (!p.active) {
+        return false;
+    }
+
+    const int asyncFailure = p.asyncFailure->exchange(0);
+    if (asyncFailure == 1 && p.cunnyReady) {
+        logLine("[MetalFX] previous CuNNy GPU submission failed; falling back to MetalFX");
+        p.cunnyReady = false;
+        p.scalerMode = 0;
+    } else if (asyncFailure != 0) {
+        logLine("[MetalFX] previous GPU submission failed; disabling Metal presenter");
+        p.active = false;
         return false;
     }
 
@@ -870,6 +966,11 @@ bool Presenter::present(SDL_Surface *frame) {
                bytesPerRow:frame->pitch];
 
     id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+    if (!blit) {
+        logLine("[MetalFX] disabled: blit encoder creation failed");
+        p.active = false;
+        return false;
+    }
     [blit copyFromTexture:staging
               sourceSlice:0
               sourceLevel:0
@@ -955,20 +1056,35 @@ bool Presenter::present(SDL_Surface *frame) {
     }
     [blit endEncoding];
 
-    // Selective AA runs at game resolution on the unmasked pixels only; the
-    // masked (protected) pixels pass through untouched. The result feeds
-    // MetalFX, which still processes the whole frame including text.
-    id<MTLTexture> srcTexture = p.inputTexture;
+    // Selective AA runs at game resolution on the unmasked pixels only. Feed
+    // the result into either scaler, then protect glyphs again in the final
+    // composite so neither CuNNy nor MetalFX reconstructs the text layer.
+    id<MTLTexture> scalerInput = p.inputTexture;
     bool aaActive = p.aaEnabled && maskHasContent && p.useScaler;
+    if (aaActive) {
+        if (!encodeAAPass(cb, p, p.inputTexture, p.aaTexture, p.maskTexture, p.aaPipeline,
+                          1.0f / (float)p.gameW, 1.0f / (float)p.gameH)) {
+            p.active = false;
+            return false;
+        }
+        scalerInput = p.aaTexture;
+    } else if (p.aaEnabled && !p.aaDisabledLogged && !maskHasContent) {
+        logLine("[MetalFX] selective AA off: empty exclusion mask (no text layer this frame)");
+        p.aaDisabledLogged = true;
+    }
+
+    id<MTLTexture> srcTexture = scalerInput;
 
     // CuNNy 2x CNN path (scalerMode 1 or 2), only when actually upscaling.
     bool cunnyActive = p.cunnyReady && p.scalerMode != 0 && p.useScaler;
+    bool encodedCunny = false;
     if (cunnyActive) {
-        if (!encodeCunny(cb, p)) {
+        if (!encodeCunny(cb, p, scalerInput)) {
             logLine("[MetalFX] cunny disabled: encode failed; falling back to MetalFX");
             p.cunnyReady = false;
             cunnyActive = false;
         } else {
+            encodedCunny = true;
             const int c2w = p.gameW * 2, c2h = p.gameH * 2;
             if (abs(p.outW - c2w) <= 2 && abs(p.outH - c2h) <= 2) {
                 // target ~= 2x: CuNNy -> final pass directly.
@@ -976,12 +1092,18 @@ bool Presenter::present(SDL_Surface *frame) {
             } else if (p.outW > c2w || p.outH > c2h) {
                 if (p.scalerMode == 2) {
                     // target > 2x: CuNNy -> MetalFX -> final.
-                    p.scaler.colorTexture = p.cunnyOut;
-                    p.scaler.inputContentWidth = (NSUInteger)c2w;
-                    p.scaler.inputContentHeight = (NSUInteger)c2h;
-                    p.scaler.outputTexture = p.outputTexture;
-                    [p.scaler encodeToCommandBuffer:cb];
-                    srcTexture = p.outputTexture;
+                    if (!p.cunnyScaler) {
+                        logLine("[MetalFX] cunny+metalfx scaler missing; using CuNNy only");
+                        p.scalerMode = 1;
+                        srcTexture = p.cunnyOut;
+                    } else {
+                        p.cunnyScaler.colorTexture = p.cunnyOut;
+                        p.cunnyScaler.inputContentWidth = (NSUInteger)c2w;
+                        p.cunnyScaler.inputContentHeight = (NSUInteger)c2h;
+                        p.cunnyScaler.outputTexture = p.outputTexture;
+                        [p.cunnyScaler encodeToCommandBuffer:cb];
+                        srcTexture = p.outputTexture;
+                    }
                 } else {
                     // CuNNy only: final pass linearly upscales 2x -> target.
                     srcTexture = p.cunnyOut;
@@ -1003,18 +1125,6 @@ bool Presenter::present(SDL_Surface *frame) {
     }
 
     if (!cunnyActive) {
-        if (aaActive) {
-            if (!encodeAAPass(cb, p, p.inputTexture, p.aaTexture, p.maskTexture, p.aaPipeline,
-                              1.0f / (float)p.gameW, 1.0f / (float)p.gameH)) {
-                p.active = false;
-                return false;
-            }
-            srcTexture = p.aaTexture;
-        } else if (p.aaEnabled && !p.aaDisabledLogged && !maskHasContent) {
-            logLine("[MetalFX] selective AA off: empty exclusion mask (no text layer this frame)");
-            p.aaDisabledLogged = true;
-        }
-
         if (p.useScaler) {
             p.scaler.colorTexture = srcTexture;
             p.scaler.inputContentWidth = (NSUInteger)p.gameW;
@@ -1031,9 +1141,14 @@ bool Presenter::present(SDL_Surface *frame) {
     rpd.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
     rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
     id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rpd];
-    if (!aaActive && maskReady && p.useScaler) {
-        // Legacy text-protected composite: MetalFX everywhere except glyph
-        // areas, which sample the plain input (linear upscale).
+    if (!re) {
+        logLine("[MetalFX] disabled: render encoder creation failed");
+        p.active = false;
+        return false;
+    }
+    if (maskReady && p.useScaler) {
+        // Text-protected composite: processed image everywhere except glyph
+        // areas, which sample the plain input with linear scaling.
         [re setRenderPipelineState:p.maskedPipeline];
         [re setFragmentTexture:srcTexture atIndex:0];
         [re setFragmentTexture:p.inputTexture atIndex:1];
@@ -1058,12 +1173,22 @@ bool Presenter::present(SDL_Surface *frame) {
 
     p.layer.displaySyncEnabled = YES;
     [cb presentDrawable:drawable];
+    const bool submittedWithCunny = encodedCunny;
+    std::shared_ptr<std::atomic<int>> failureSignal = p.asyncFailure;
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+        if (completed.status != MTLCommandBufferStatusCompleted) {
+            failureSignal->store(submittedWithCunny ? 1 : 2);
+            const char *message = completed.error ? [[completed.error localizedDescription] UTF8String] : "unknown";
+            logLine("[MetalFX] command buffer failed: %s", message);
+        }
+    }];
     if (p.frameCount % 60 == 0) {
         // Periodic GPU timing for A/B (macOS 11+ API).
+        const int submittedScalerMode = p.scalerMode;
         [cb addCompletedHandler:^(id<MTLCommandBuffer> completed) {
             if (completed.status == MTLCommandBufferStatusCompleted && completed.GPUEndTime > 0) {
                 logLine("[MetalFX] gpu frame time: %.3f ms (scaler=%d)",
-                        (completed.GPUEndTime - completed.GPUStartTime) * 1000.0, p.scalerMode);
+                        (completed.GPUEndTime - completed.GPUStartTime) * 1000.0, submittedScalerMode);
             }
         }];
     }

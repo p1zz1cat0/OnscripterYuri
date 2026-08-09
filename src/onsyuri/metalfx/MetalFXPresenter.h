@@ -1,9 +1,9 @@
 // MetalFX Spatial MVP presenter for OnscripterYuri (macOS only).
 //
 // Takes the already-composited CPU frame (accumulation_surface, ARGB8888),
-// uploads it to a host-owned Metal texture, runs MTLFXSpatialScaler, and
-// presents the result through a final render pass onto the SDL-created
-// CAMetalLayer drawable.
+// uploads it to host-owned Metal textures, runs the selected MetalFX/CuNNy
+// scaling pipeline, and presents the result through a final render pass onto
+// the SDL-created CAMetalLayer drawable.
 //
 // The SDL renderer path stays untouched: when this presenter is inactive or
 // fails, ONScripter continues to use SDL_UpdateTexture/RenderCopy/RenderPresent.
@@ -24,7 +24,7 @@ public:
     Presenter(SDL_Window *window, void *metal_view, int game_width, int game_height);
     ~Presenter();
 
-    // True when initialization succeeded and MetalFX is enabled for this session.
+    // True when initialization succeeded and the Metal presenter is active.
     bool isActive() const;
 
     // Uploads the full CPU frame and presents it. Returns false when the
