@@ -90,6 +90,8 @@ function(config_darwin TARGET_NAME)
     endif()
     add_executable(${TARGET_NAME} ${ONSYURI_CODE})
     target_sources(${TARGET_NAME} PRIVATE src/onsyuri/YoghourtPresentation.mm)
+    target_sources(${TARGET_NAME} PRIVATE
+        "${YOGHOURT_SPATIAL_PRESENTER_DIR}/YoghourtDockIcon.mm")
     target_sources(${TARGET_NAME} PRIVATE src/onsyuri/metalfx/MetalFXPresenter.mm)
     target_sources(${TARGET_NAME} PRIVATE
         "${YOGHOURT_SPATIAL_PRESENTER_DIR}/YoghourtSpatialPresenter.mm")
@@ -136,6 +138,7 @@ function(config_darwin TARGET_NAME)
             "-framework Metal"
             "-framework MetalFX"
             "-framework QuartzCore"
+            "-framework ImageIO"
     )
 endfunction()
 
