@@ -51,6 +51,7 @@
 #endif
 
 #if defined(MACOSX)
+#include "SurfaceLayout.h"
 namespace onsyuri_metalfx { class Presenter; }
 #endif
 
@@ -356,6 +357,9 @@ private:
     bool fullscreen_mode;
     bool stretch_mode;
     bool window_mode;
+#if defined(MACOSX)
+    yoghourt_spatial::SurfaceLayout surface_layout;
+#endif
 
     // start-up options
     bool cdaudio_flag;
@@ -431,6 +435,8 @@ private:
 
     void initSDL();
     void calcRenderRect();
+    bool mapWindowToGame(int &x, int &y) const;
+    void mapGameToWindow(int &x, int &y) const;
     void openAudio(int freq=-1);
     void reset(); // called on definereset
     void resetSub(); // called on reset
@@ -444,6 +450,7 @@ private:
     void warpMouse(int x, int y);
     void setFullScreen(bool fullscreen);
 public:
+    void yoghourtWindowModeChanged(bool fullscreen);
     void executeLabel();
     void runScript();
     AnimationInfo *getSpriteInfo(int no){ return &sprite_info[no]; };

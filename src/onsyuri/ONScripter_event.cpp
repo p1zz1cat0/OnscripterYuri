@@ -685,8 +685,7 @@ void ONScripter::shiftCursorOnButton( int diff )
         if      (y < 0)              y = 0;
         else if (y >= screen_height) y = screen_height-1;
 
-        x = x * input_view_rect.w / screen_width + input_view_rect.x;
-        y = y * input_view_rect.h / screen_height + input_view_rect.y;
+        mapGameToWindow(x, y);
 
         shift_over_button = button->no;
         warpMouse(x, y);
@@ -1242,8 +1241,7 @@ void ONScripter::runEventLoop()
           case SDL_MOUSEMOTION:
             // printf("## SDL_MOUSEMOTION (%d, %d) ", event.button.x, event.button.y);
 #if !defined(WEB)
-            event.button.x = (event.button.x - input_view_rect.x) * screen_scale_ratio1;
-            event.button.y = (event.button.y - input_view_rect.y) * screen_scale_ratio2;
+            mapWindowToGame(event.button.x, event.button.y);
 #endif
             // printf("-> (%d, %d)\n", event.button.x, event.button.y);
             if (mouseMoveEvent( &event.motion )) return;
@@ -1272,8 +1270,7 @@ void ONScripter::runEventLoop()
             current_button_state.event_button = event.button.button;
 #if !defined(WEB)
             // printf("## SDL_MOUSEBUTTONUP (%d, %d) ", event.button.x, event.button.y);
-            event.button.x = (event.button.x - input_view_rect.x) * screen_scale_ratio1;
-            event.button.y = (event.button.y - input_view_rect.y) * screen_scale_ratio2;
+            mapWindowToGame(event.button.x, event.button.y);
             // printf("-> (%d, %d)\n", event.button.x, event.button.y);
 #endif
 

@@ -1,6 +1,10 @@
 #import <AppKit/AppKit.h>
+#import <SDL2/SDL_syswm.h>
 
 #import "YoghourtDockIcon.h"
+#import "YoghourtWindowPresentation.h"
+
+extern "C" void YoghourtONSWindowLayoutChanged(int width, int height, bool fullscreen);
 
 static NSString *YoghourtEnvironmentValue(NSString *key) {
     NSString *value = NSProcessInfo.processInfo.environment[key];
@@ -17,7 +21,7 @@ extern "C" void YoghourtPreparePresentation(void) {
     }
 }
 
-extern "C" void YoghourtApplyPresentation(void) {
+extern "C" void YoghourtApplyPresentation(SDL_Window *sdlWindow) {
     @autoreleasepool {
         NSString *title = YoghourtEnvironmentValue(@"YOGHOURT_GAME_TITLE");
         if (title) {
@@ -30,6 +34,13 @@ extern "C" void YoghourtApplyPresentation(void) {
         if (iconPath) {
             NSImage *icon = YoghourtLoadDockIcon(iconPath);
             if (icon) NSApp.applicationIconImage = icon;
+        }
+
+        SDL_SysWMinfo info;
+        SDL_VERSION(&info.version);
+        if (sdlWindow && SDL_GetWindowWMInfo(sdlWindow, &info) == SDL_TRUE) {
+            YoghourtConfigureGameWindow((__bridge void *)info.info.cocoa.window,
+                                        YoghourtONSWindowLayoutChanged);
         }
     }
 }

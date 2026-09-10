@@ -92,9 +92,15 @@ function(config_darwin TARGET_NAME)
     target_sources(${TARGET_NAME} PRIVATE src/onsyuri/YoghourtPresentation.mm)
     target_sources(${TARGET_NAME} PRIVATE
         "${YOGHOURT_SPATIAL_PRESENTER_DIR}/YoghourtDockIcon.mm")
+    target_sources(${TARGET_NAME} PRIVATE
+        "${YOGHOURT_SPATIAL_PRESENTER_DIR}/YoghourtWindowPresentation.mm")
     target_sources(${TARGET_NAME} PRIVATE src/onsyuri/metalfx/MetalFXPresenter.mm)
     target_sources(${TARGET_NAME} PRIVATE
         "${YOGHOURT_SPATIAL_PRESENTER_DIR}/YoghourtSpatialPresenter.mm")
+    set_source_files_properties(
+        src/onsyuri/YoghourtPresentation.mm
+        "${YOGHOURT_SPATIAL_PRESENTER_DIR}/YoghourtWindowPresentation.mm"
+        PROPERTIES COMPILE_FLAGS "-fobjc-arc")
     message("Darwin enviroment for ${TARGET_NAME}, type ${CMAKE_BUILD_TYPE}, compiler ${CMAKE_C_COMPILER}")
     target_compile_definitions(${TARGET_NAME} PRIVATE
             ${ONSYURI_DEFINES}

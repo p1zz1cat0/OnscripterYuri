@@ -40,7 +40,14 @@
 #include <stdlib.h>
 
 #if defined(MACOSX)
-extern "C" void YoghourtApplyPresentation(void);
+extern "C" void YoghourtApplyPresentation(SDL_Window *window);
+extern "C" void YoghourtSetGameWindowFullscreen(bool fullscreen);
+extern ONScripter ons;
+extern "C" void YoghourtONSWindowLayoutChanged(int width, int height, bool fullscreen) {
+    (void)width;
+    (void)height;
+    ons.yoghourtWindowModeChanged(fullscreen);
+}
 #endif
 
 extern Coding2UTF16 *coding2utf16;
@@ -89,33 +96,53 @@ void ONScripter::calcRenderRect() {
 
     bool shouldAlign = (!stretch_mode || !fullscreen_mode) && (!force_window_height || !force_window_width);
 
+#if defined(MACOSX)
+    int window_width, window_height;
+    SDL_GetWindowSize(window, &window_width, &window_height);
+    surface_layout = yoghourt_spatial::SurfaceLayout(
+        {static_cast<double>(window_width), static_cast<double>(window_height)},
+        {static_cast<double>(width), static_cast<double>(height)},
+        {static_cast<double>(screen_width), static_cast<double>(screen_height)},
+        shouldAlign ? yoghourt_spatial::SurfacePolicy::fit
+                    : yoghourt_spatial::SurfacePolicy::stretch);
+    const auto render = surface_layout.pixelContentRect();
+    render_view_rect = {render.x, render.y, render.width, render.height};
+    screen_device_width = render.width;
+    screen_device_height = render.height;
+    const auto inputOrigin = surface_layout.toWindow({0, 0});
+    const auto inputEnd = surface_layout.toWindow({
+        static_cast<double>(screen_width), static_cast<double>(screen_height)});
+    input_view_rect = {
+        static_cast<int>(std::lround(inputOrigin.x)),
+        static_cast<int>(std::lround(inputOrigin.y)),
+        static_cast<int>(std::lround(inputEnd.x - inputOrigin.x)),
+        static_cast<int>(std::lround(inputEnd.y - inputOrigin.y)),
+    };
+    screen_scale_ratio1 = static_cast<float>(screen_width) / input_view_rect.w;
+    screen_scale_ratio2 = static_cast<float>(screen_height) / input_view_rect.h;
+#else
     if (shouldAlign) {
         alignAspectRatio(screen_width, screen_height, screen_device_width, screen_device_height);
     }
-
     render_view_rect.x = (width - screen_device_width) / 2;
     render_view_rect.y = (height - screen_device_height) / 2;
     render_view_rect.w = screen_device_width;
     render_view_rect.h = screen_device_height;
     input_view_rect = render_view_rect;
-
-#if defined(MACOSX) || defined(_WIN32)
+#if defined(_WIN32)
     int window_width, window_height;
     SDL_GetWindowSize(window, &window_width, &window_height);
     int input_width = window_width;
     int input_height = window_height;
-    if (shouldAlign) {
-        alignAspectRatio(screen_width, screen_height, input_width, input_height);
-    }
-    input_view_rect.x = (window_width - input_width) / 2;
-    input_view_rect.y = (window_height - input_height) / 2;
-    input_view_rect.w = input_width;
-    input_view_rect.h = input_height;
+    if (shouldAlign) alignAspectRatio(screen_width, screen_height, input_width, input_height);
+    input_view_rect = {(window_width - input_width) / 2, (window_height - input_height) / 2,
+                       input_width, input_height};
     screen_scale_ratio1 = (float)screen_width / input_view_rect.w;
     screen_scale_ratio2 = (float)screen_height / input_view_rect.h;
 #else
     screen_scale_ratio1 = (float)screen_width / screen_device_width;
     screen_scale_ratio2 = (float)screen_height / screen_device_height;
+#endif
 #endif
 
 //     printf("## calcRenderRect screen %dx%d, screen_device %dx%d,  %.2f, %.2f\n",
@@ -129,6 +156,36 @@ void ONScripter::calcRenderRect() {
         float output_size[2] = {(float)render_view_rect.w, (float)render_view_rect.h};
         gles_renderer->setConstBuffer(input_size, output_size, sharpness);
     }
+#endif
+}
+
+bool ONScripter::mapWindowToGame(int &x, int &y) const {
+#if defined(MACOSX)
+    yoghourt_spatial::SurfacePoint mapped;
+    if(!surface_layout.toGameFromWindow(
+           {static_cast<double>(x), static_cast<double>(y)}, mapped)) {
+        x = y = -1;
+        return false;
+    }
+    x = static_cast<int>(std::lround(mapped.x));
+    y = static_cast<int>(std::lround(mapped.y));
+    return true;
+#else
+    x = (x - input_view_rect.x) * screen_scale_ratio1;
+    y = (y - input_view_rect.y) * screen_scale_ratio2;
+    return true;
+#endif
+}
+
+void ONScripter::mapGameToWindow(int &x, int &y) const {
+#if defined(MACOSX)
+    const auto mapped = surface_layout.toWindow(
+        {static_cast<double>(x), static_cast<double>(y)});
+    x = static_cast<int>(std::lround(mapped.x));
+    y = static_cast<int>(std::lround(mapped.y));
+#else
+    x = x * input_view_rect.w / screen_width + input_view_rect.x;
+    y = y * input_view_rect.h / screen_height + input_view_rect.y;
 #endif
 }
 
@@ -289,7 +346,7 @@ void ONScripter::initSDL()
         exit(-1);
     }
 #if defined(MACOSX)
-    YoghourtApplyPresentation();
+    YoghourtApplyPresentation(window);
 #endif
 #if defined(MACOSX)
     // Linear sampling for SDL's RenderCopy scaling; the sharpness-only hint
@@ -1133,6 +1190,10 @@ void ONScripter::warpMouse(int x, int y) {
 }
 
 void ONScripter::setFullScreen(bool fullscreen) {
+#if defined(MACOSX)
+    YoghourtSetGameWindowFullscreen(fullscreen);
+    return;
+#endif
     if (fullscreen != fullscreen_mode) {
 #if defined(ANDROID)
     SDL_SetWindowFullscreen(window, fullscreen ? SDL_WINDOW_FULLSCREEN : 0);
@@ -1143,6 +1204,12 @@ void ONScripter::setFullScreen(bool fullscreen) {
         flushDirect(screen_rect, refreshMode());
         fullscreen_mode = fullscreen;
     }
+}
+
+void ONScripter::yoghourtWindowModeChanged(bool fullscreen) {
+    fullscreen_mode = fullscreen;
+    stretch_mode = false;
+    calcRenderRect();
 }
 
 void ONScripter::executeLabel()
@@ -1301,8 +1368,7 @@ void ONScripter::refreshMouseOverButton()
         mx = input_view_rect.w;
         my = input_view_rect.h;
     }
-    mx = (mx - input_view_rect.x) * screen_scale_ratio1;
-    my = (my - input_view_rect.y) * screen_scale_ratio2;
+    mapWindowToGame(mx, my);
     mouseOverCheck( mx, my );
 }
 

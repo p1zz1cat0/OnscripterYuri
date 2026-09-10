@@ -115,8 +115,9 @@ void ONScripter::leaveSystemCall( bool restore_flag )
         event_mode = shelter_event_mode;
         draw_cursor_flag = shelter_draw_cursor_flag;
         if ( event_mode & WAIT_BUTTON_MODE ){
-            int x = shelter_mouse_state.x * input_view_rect.w / screen_width + input_view_rect.x;
-            int y = shelter_mouse_state.y * input_view_rect.h / screen_height + input_view_rect.y;
+            int x = shelter_mouse_state.x;
+            int y = shelter_mouse_state.y;
+            mapGameToWindow(x, y);
             warpMouse(x, y);
         }
     }
